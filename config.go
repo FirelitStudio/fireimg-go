@@ -16,6 +16,8 @@ const (
 	MaxFilesPerRequest = 20
 	// MaxSizesPerRequest is the API limit for pre-generated variants.
 	MaxSizesPerRequest = 20
+	// MaxConcurrentPuts is how many S3 PUTs UploadMany runs at once.
+	MaxConcurrentPuts = 4
 
 	defaultTimeout = 2 * time.Minute
 )

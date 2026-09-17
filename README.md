@@ -75,7 +75,7 @@ result.CDNURL   // https://img.fireimg.com/{project}/images/feed_items/43/uuid.j
 
 Optional `Sizes` (up to 20) are generated asynchronously after the `PUT` and **replace** the project's default image params for that upload. Omit `Sizes` (nil) to keep project defaults. Pass `Sizes: []fireimg.Size{}` to pre-generate only FireImg's 80px dashboard thumbnail.
 
-`UploadMany` batches the same way as the CLI (up to 20 files per presign request). Shared sizes come from the first file that sets them.
+`UploadMany` batches the same way as the CLI (up to 20 files per presign request). Shared sizes come from the first file that sets them. After one presign response, S3 `PUT`s run in parallel, up to `MaxConcurrentPuts` (4). The first `PUT` error cancels the rest.
 
 ```go
 result, err := client.Upload(ctx, fireimg.Upload{

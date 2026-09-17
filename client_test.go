@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func testClient(t *testing.T, handler http.HandlerFunc) *Client {
@@ -178,6 +180,59 @@ func TestUploadFromPath(t *testing.T) {
 	}
 	if got != "from-disk" {
 		t.Fatalf("body %q", got)
+	}
+}
+
+func TestUploadManyPutsInParallel(t *testing.T) {
+	const n = 5
+	var current, peak, puts atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/api/presigned-upload-urls", func(w http.ResponseWriter, r *http.Request) {
+		urls := make([]presignURL, n)
+		for i := range urls {
+			name := "f" + string(rune('a'+i)) + ".jpg"
+			urls[i] = presignURL{Filename: name, UploadURL: "http://" + r.Host + "/s3/" + name}
+		}
+		_ = json.NewEncoder(w).Encode(presignResponse{URLs: urls})
+	})
+	mux.HandleFunc("/s3/", func(w http.ResponseWriter, r *http.Request) {
+		live := current.Add(1)
+		for {
+			old := peak.Load()
+			if live <= old || peak.CompareAndSwap(old, live) {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+		current.Add(-1)
+		puts.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client, err := New(Config{APIKey: "k", Project: "p", APIBase: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make([]Upload, n)
+	for i := range files {
+		files[i] = Upload{Filename: "f" + string(rune('a'+i)) + ".jpg", ContentType: "image/jpeg", Bytes: []byte("x")}
+	}
+	results, err := client.UploadMany(context.Background(), files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != n || puts.Load() != n {
+		t.Fatalf("results=%d puts=%d", len(results), puts.Load())
+	}
+	if peak.Load() > MaxConcurrentPuts {
+		t.Fatalf("peak concurrency %d > %d", peak.Load(), MaxConcurrentPuts)
+	}
+	if peak.Load() < 2 {
+		t.Fatalf("expected overlapping PUTs, peak %d", peak.Load())
+	}
+	if results[0].ImageKey != "fa.jpg" || results[4].ImageKey != "fe.jpg" {
+		t.Fatalf("order %+v", results)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
 
 // FileSpec is one file in a presign request.
@@ -175,33 +176,65 @@ func (c *Client) UploadMany(ctx context.Context, files []Upload) ([]UploadResult
 	if err != nil {
 		return nil, err
 	}
+	return c.putUploads(ctx, rows, specs, bodies)
+}
 
+func (c *Client) putUploads(ctx context.Context, rows []PresignResult, specs []FileSpec, bodies [][]byte) ([]UploadResult, error) {
 	byName := make(map[string]int, len(specs))
 	for i, spec := range specs {
 		byName[spec.Filename] = i
 	}
-
-	out := make([]UploadResult, 0, len(rows))
 	for _, row := range rows {
-		index, ok := byName[row.Filename]
-		if !ok {
+		if _, ok := byName[row.Filename]; !ok {
 			return nil, clientError("upload", fmt.Sprintf("presign returned unexpected filename %q", row.Filename))
 		}
-		if err := c.Put(ctx, row.UploadURL, specs[index].ContentType, bytes.NewReader(bodies[index])); err != nil {
-			return nil, err
-		}
-		key := row.Filename
-		if key == "" {
-			key = specs[index].Filename
-		}
-		out = append(out, UploadResult{
-			Filename: key,
-			ImageKey: key,
-			CDNURL:   c.PublicURL(key),
-			S3Key:    row.S3Key,
-		})
 	}
-	return out, nil
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	out := make([]UploadResult, len(rows))
+	errCh := make(chan error, 1)
+	sem := make(chan struct{}, MaxConcurrentPuts)
+	var wg sync.WaitGroup
+	for i, row := range rows {
+		index := byName[row.Filename]
+		wg.Add(1)
+		go func(i int, row PresignResult, index int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			if err := c.Put(ctx, row.UploadURL, specs[index].ContentType, bytes.NewReader(bodies[index])); err != nil {
+				cancel()
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			key := row.Filename
+			if key == "" {
+				key = specs[index].Filename
+			}
+			out[i] = UploadResult{
+				Filename: key,
+				ImageKey: key,
+				CDNURL:   c.PublicURL(key),
+				S3Key:    row.S3Key,
+			}
+		}(i, row, index)
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+		return out, nil
+	}
 }
 
 // Put uploads raw bytes to a presigned S3 URL. It does not send the API key.
